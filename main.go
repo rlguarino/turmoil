@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -55,7 +56,29 @@ func NewNetwork(s Store) *Network {
 	}
 }
 
+func (n *Network) sendMsg(dst, msg string) {
+	c, ok := n.nodeQueues[dst]
+	if !ok {
+		return
+	}
+	c <- msg
+}
+
+type TurmoilMessage struct {
+	Source       string
+	Destination  string
+	Type         string
+	Id           string
+	InResponseTo string
+	Body         json.RawMessage
+}
+
+type InitMessage struct {
+	Name string
+}
+
 func (n *Network) StartNode(name string, executablePath string) error {
+	log := slog.With("node", name)
 	stderrFh, err := n.store.createStoreFile(filepath.Join("node_logs", fmt.Sprintf("%s.log", name)))
 	if err != nil {
 		return fmt.Errorf("error creating node log file: %w", err)
@@ -70,7 +93,7 @@ func (n *Network) StartNode(name string, executablePath string) error {
 	if err != nil {
 		return fmt.Errorf("error creating StdinPipe: %w", err)
 	}
-	inbox := make(chan string)
+	inbox := make(chan string, 100)
 	n.nodeQueuesLock.Lock()
 	if _, ok := n.nodeQueues[name]; ok {
 		panic(fmt.Sprintf("node already exists with name:%v", name))
@@ -80,26 +103,59 @@ func (n *Network) StartNode(name string, executablePath string) error {
 	go func() {
 		stdout := bufio.NewScanner(nodeStdout)
 		for stdout.Scan() {
-			line := stdout.Text()
+			line := stdout.Bytes()
+			log.Info("got line", "node", name, "line", line)
 			// TODO: Queue the message in the destinations channel
-			slog.Info("stdout", "line", line)
+			log.Debug("stdout", "line", line)
+			msg := TurmoilMessage{}
+			err := json.Unmarshal(line, &msg)
+			if err != nil {
+				panic(err)
+			}
+			n.nodeQueues[msg.Destination] <- string(line)
 		}
-		slog.Info("finished reading from stdout")
+		log.Debug("finished reading from stdout")
 	}()
 
 	go func() {
 		writer := bufio.NewWriter(nodeStdin)
-		writer.WriteString("{\"type\":\"init\"}\n")
-		err := writer.Flush()
-		if err != nil {
-			slog.Error("error flushing", "command", c, "error", err)
+		for {
+			select {
+			case msg := <-inbox:
+				log := log.With("msg", msg)
+				log.Info("got msg from inbox", "msg", msg)
+				_, err := writer.WriteString(msg + "\n")
+				if err != nil {
+					panic(err)
+				}
+				log.Info("flushing")
+				err = writer.Flush()
+				if err != nil {
+					log.Error("error flushing", "command", c, "error", err)
+				}
+				log.Info("flushed")
+			}
 		}
-		slog.Info("finish writing to stdin")
-		// TODO: Read from our inputchannel and write forever
 	}()
 	if err = c.Start(); err != nil {
 		return fmt.Errorf("c.Start() error: %w", err)
 	}
+
+	body, err := json.Marshal(InitMessage{Name: name})
+	if err != nil {
+		return fmt.Errorf("error marshalling init message: %w", err)
+	}
+	messageBytes, err := json.Marshal(TurmoilMessage{
+		Source:      "network",
+		Destination: name,
+		Type:        "init",
+		Body:        body,
+	})
+	if err != nil {
+		return fmt.Errorf("error marshalling base turmoil message: %w", err)
+	}
+	log.Info("sending init message", "message", string(messageBytes))
+	inbox <- string(messageBytes)
 	return nil
 }
 
@@ -116,13 +172,13 @@ func main() {
 	if err != nil {
 		slog.Error("Start returned an error", "error", err)
 	} else {
-		slog.Info("Start returned without error")
+		slog.Debug("Start returned without error")
 	}
-	err = network.StartNode("n2", serverExecPath)
+	err = network.StartNode("c1", "./echo-client")
 	if err != nil {
 		slog.Error("Start returned an error", "error", err)
 	} else {
-		slog.Info("Start returned without error")
+		slog.Debug("Start returned without error")
 	}
 
 	slog.Info("Waiting")

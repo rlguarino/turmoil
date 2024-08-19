@@ -1,4 +1,3 @@
-// A server that will echo the message is receives.
 package main
 
 import (
@@ -7,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 )
 
 type TurmoilMessage struct {
@@ -22,7 +22,11 @@ type InitMessage struct {
 	Name string
 }
 
-type EchoBody struct {
+type EchoMessage struct {
+	Message string
+}
+
+type EchoResponse struct {
 	Message string
 }
 
@@ -51,12 +55,10 @@ func processesInitMessage(stdin *bufio.Scanner) (string, error) {
 }
 
 func main() {
-	// Servers cannot log anything but turmoil messages to STDOUT.
+	// Nodes cannot log anything but turmoil messages to STDOUT.
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 	stdin := bufio.NewScanner(os.Stdin)
-	output := json.NewEncoder(os.Stdout)
-
 	nodeName := "unknown"
 	var err error
 	log.Debug("waiting for init message")
@@ -65,36 +67,48 @@ func main() {
 		panic(err)
 	}
 	log.Debug("processed init message", "name", nodeName)
-	for stdin.Scan() {
-		line := stdin.Bytes()
-		msg := TurmoilMessage{}
-		err := json.Unmarshal(line, &msg)
-		if err != nil {
-			log.Error("Unmarshal error", "error", err, "line", line)
-		}
-		switch msg.Type {
-		case "init":
-			log.Info("got init message", "msg", msg)
-		case "echo":
-			log.Info("got echo message", "msg", msg)
-			echo := EchoBody{}
-			err := json.Unmarshal(msg.Body, &echo)
+	go func() {
+		for stdin.Scan() {
+			line := stdin.Bytes()
+			msg := TurmoilMessage{}
+			err := json.Unmarshal(line, &msg)
 			if err != nil {
-				log.Info("error unmashalling EchoBody", "error", err)
+				log.Warn("unable to unmarshal turmoil message", "raw_line", line)
 				continue
 			}
+			switch msg.Type {
+			case "echo_ok":
+				echoBody := EchoMessage{}
+				json.Unmarshal(msg.Body, &echoBody)
+				log.Info("got echo_ok message", "msg", msg)
+			default:
+				log.Info("got unexpected message", "msg", "msg")
+			}
 
-			respMessage := TurmoilMessage{
-				Source:       nodeName,
-				Destination:  msg.Source,
-				Type:         "echo_ok",
-				InResponseTo: msg.Id,
-				Body:         msg.Body,
-			}
-			err = output.Encode(respMessage)
-			if err != nil {
-				log.Error("error encoding response to echo", "error", err, "message", respMessage)
-			}
+		}
+	}()
+	encoder := json.NewEncoder(os.Stdout)
+	id := 0
+	for {
+		id++
+		time.Sleep(time.Second / 2)
+		msgBody, err := json.Marshal(EchoMessage{
+			Message: "hello world",
+		})
+		if err != nil {
+			panic(err)
+		}
+		baseMsg := TurmoilMessage{
+			Source:      nodeName,
+			Destination: "n1",
+			Type:        "echo",
+			Id:          fmt.Sprintf("%d", id),
+			Body:        []byte(msgBody),
+		}
+		log.Info("sending message", "message", baseMsg)
+		err = encoder.Encode(baseMsg)
+		if err != nil {
+			panic(err)
 		}
 	}
 }
